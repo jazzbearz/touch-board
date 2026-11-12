@@ -187,7 +187,8 @@ class Keyboard extends St.BoxLayout {
 
     _build() {
         const split = this._settings.get_boolean(Key.SPLIT);
-        const definition = rowsFor(this._settings.get_string(Key.LAYOUT), split);
+        this._hangulLayout = this._language.isHangul();
+        const definition = rowsFor(this._settings.get_string(Key.LAYOUT), split, this._hangulLayout);
         const total = Math.max(...definition.map(line => line.reduce((sum, spec) => sum + spec.span, 0)));
         this._total = total;
         this._widest = split ? widest(definition) : 0;
@@ -401,6 +402,8 @@ class Keyboard extends St.BoxLayout {
             this._tracked.push(this._track(button, () => {}, () => this._toggleNum()));
         } else if (spec.kind === Kind.FN) {
             this._tracked.push(this._fnLayer.wire(button));
+        } else if (spec.kind === Kind.HANGUL) {
+            this._tracked.push(this._track(button, () => {}, () => this._language.toggleHangul()));
         } else if (spec.fslot) {
             const entry = {slot: spec.fslot, button, base: spec.code, label: spec.label, code: spec.code, span: spec.span, override: false};
             this._fkeys.push(entry);
@@ -787,6 +790,11 @@ class Keyboard extends St.BoxLayout {
     }
 
     _relabel() {
+        if (this._hangulLayout !== this._language.isHangul()) {
+            this.reset();
+            this._rebuild();
+            return;
+        }
         if (!supports(this._language.currentId()))
             console.error(`touch-board: unsupported layout "${this._language.currentId()}", falling back to us glyphs`);
         this._paint();

@@ -16,7 +16,9 @@ export class Composer {
     composes() {
         if (!Main.inputMethod.currentFocus)
             return false;
-        if (!this._language.composing())
+        // ibus-hangul needs the evdev keycode and Shift state. Shell's
+        // handleVirtualKey only supplies a keysym.
+        if (!this._language.composing() || this._language.isHangul())
             return false;
         return this._shortcutFree();
     }

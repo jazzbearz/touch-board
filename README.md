@@ -215,7 +215,7 @@ It closes on:
 - **Focus loss.** Only when a tap opened it. Opened from the panel button, it stays up.
 - **Hardware keyboard.** The first key from a USB or Bluetooth keyboard that edits the field or moves the caret. Power, volume and brightness buttons don't count, and neither does switching the layout with Super+Space.
 
-While it is up, the focused window moves up by the keyboard height if the keyboard would cover the caret. Dragging the window cancels the lift.
+If an app reports a caret that the keyboard would cover, Touch Board moves the focused window up just enough to reveal it. For the ChatGPT desktop app, Touch Board uses the bottom of the window when the app doesn't report a caret. Dragging the window cancels the lift.
 
 > [!TIP]
 > The panel button opens the keyboard anywhere, the lock screen included, and keeps it up until you close it. With **Screen Keyboard** on in the Accessibility settings, mouse clicks open it too, and Touch Board stands in for the GNOME keyboard.

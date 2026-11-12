@@ -241,8 +241,20 @@ export const profiles = Object.freeze({
     [Layout.FULL]: full,
 });
 
-export function rowsFor(layout, split) {
-    return profiles[split && layout === Layout.FULL ? Layout.STANDARD : layout];
+export function rowsFor(layout, split, hangul) {
+    const rows = profiles[split && layout === Layout.FULL ? Layout.STANDARD : layout];
+    if (!hangul)
+        return rows;
+    const bottom = rows.at(-1).flatMap(spec => {
+        if (spec.code !== Code.SPACE)
+            return [spec];
+        const span = 1.25;
+        const space = {...spec, span: spec.span - span};
+        if (space.hinge !== undefined)
+            space.hinge -= span;
+        return [{kind: Kind.HANGUL, label: '한/영', span, compact: true}, space];
+    });
+    return [...rows.slice(0, -1), bottom];
 }
 
 export function halves(line) {

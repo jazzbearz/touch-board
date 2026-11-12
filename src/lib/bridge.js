@@ -1,6 +1,8 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Clutter from 'gi://Clutter';
+import Shell from 'gi://Shell';
+import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {KeyboardManager} from 'resource:///org/gnome/shell/ui/keyboard.js';
 import {InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -12,6 +14,7 @@ import {Injector} from './injector.js';
 import {Player} from './player.js';
 import {Language} from './language.js';
 import {Panel} from './panel.js';
+import {defaultSeat, hasPhysicalKeyboard, inputDevices} from './seat.js';
 
 const Signal = Object.freeze({
     ADDED: 'child-added',
@@ -24,9 +27,15 @@ const Signal = Object.freeze({
     UNMANAGED: 'unmanaged',
     PANEL: 'input-panel-state',
     DEVICE: 'last-device-changed',
+    DEVICE_ADDED: 'device-added',
+    DEVICE_REMOVED: 'device-removed',
+    TOUCH_MODE: 'notify::touch-mode',
+    TOUCH: 'touch-event',
+    SESSION: 'updated',
     TEXT: 'surrounding-text-set',
     CARET: 'cursor-location-changed',
     IBUS_CARET: 'set-cursor-location',
+    IBUS_FOCUS_OUT: 'focus-out',
     ACCELERATOR: 'accelerator-activated',
     SOURCE: 'current-source-changed',
 });
@@ -44,6 +53,9 @@ const State = Object.freeze({HIDDEN: 0, AUTO: 1, PINNED: 2});
 const Indicator = Object.freeze({ROLE: 'touch-board'});
 
 const Lift = Object.freeze({DURATION: 150});
+
+const Edge = Object.freeze({HEIGHT: 12, DISTANCE: 48});
+const ChatGPT = Object.freeze({DESKTOP_ID: 'chatgpt.desktop', WINDOW_CLASS: 'chatgpt'});
 
 const Switch = Object.freeze({GRACE: 250});
 
@@ -80,8 +92,14 @@ export class Bridge {
     _focusWindow = null;
     _movedWindow = null;
     _focusWindowStartY = null;
+    _focusWindowOffset = 0;
     _easing = new Set();
     _caret = null;
+    _caretAutoOpened = false;
+    _keyboardAttached = false;
+    _edgeSwipe = null;
+    _edge = null;
+    _edgeTouch = null;
 
     constructor(settings) {
         this._settings = settings;
@@ -121,6 +139,16 @@ export class Bridge {
         const last = Main.keyboard._lastDevice;
         this._direct = last !== null && direct(last);
 
+        this._edgeSwipe = Main.keyboard._bottomDragGesture ?? Main.keyboard._bottomDragAction;
+        if (this._edgeSwipe)
+            this._edgeSwipe.enabled = false;
+        // Pick a Shell actor at touch-down so the window underneath never
+        // receives the start of a sequence reserved for the keyboard.
+        this._edge = new St.Widget({reactive: true, visible: false});
+        Main.layoutManager.addTopChrome(this._edge);
+        this._track(this._edge, Signal.TOUCH, (_actor, event) => this._onEdgeTouch(event));
+        this._track(Main.sessionMode, Signal.SESSION, () => this._syncEdgeSwipe());
+
         this._track(this._box, Signal.ADDED, (_box, actor) => {
             if (actor !== this._keyboard)
                 this._resync();
@@ -138,8 +166,6 @@ export class Bridge {
             if (!this._lifted())
                 return;
             this._positionKeyboard();
-            if (this._focusWindow)
-                this._animateWindow(this._focusWindow, true);
             this._evaluate();
         });
 
@@ -155,17 +181,35 @@ export class Bridge {
             });
         });
 
-        this._track(getIBusManager(), Signal.IBUS_CARET, (_ibus, rect) => {
+        const ibus = getIBusManager();
+        this._track(ibus, Signal.IBUS_CARET, (_ibus, rect) => {
             if (Main.inputMethod.currentFocus)
                 return;
             this._onText();
-            this._onCaret(rect);
+            this._onCaret(rect, true);
+        });
+        this._track(ibus, Signal.IBUS_FOCUS_OUT, () => {
+            if (!Main.inputMethod.currentFocus)
+                this._onInputBlur();
         });
 
         this._track(global.stage, Signal.FOCUS, () => this._evaluate());
 
         this._panel = new Panel(() => this._toggleKeyboard());
         Main.panel.addToStatusArea(Indicator.ROLE, this._panel);
+
+        const seat = defaultSeat();
+        const udev = inputDevices();
+        const syncKeyboard = () => {
+            this._keyboardAttached = hasPhysicalKeyboard(seat, udev);
+            if (this._keyboardAttached && this._lifted())
+                this._hide();
+            this._syncEdgeSwipe();
+        };
+        this._track(seat, Signal.DEVICE_ADDED, syncKeyboard);
+        this._track(seat, Signal.DEVICE_REMOVED, syncKeyboard);
+        this._track(seat, Signal.TOUCH_MODE, syncKeyboard);
+        syncKeyboard();
     }
 
     _resync() {
@@ -208,8 +252,7 @@ export class Bridge {
 
     _onPanel(state) {
         if (state === Clutter.InputPanelState.OFF) {
-            if (this._state === State.AUTO && !this._switched && !this._switcher())
-                this._hide();
+            this._onInputBlur();
         } else if (state === Clutter.InputPanelState.TOGGLE) {
             const event = Clutter.get_current_event();
             this._request(event !== null && direct(event.get_source_device()));
@@ -220,6 +263,17 @@ export class Bridge {
                 return GLib.SOURCE_REMOVE;
             });
         }
+    }
+
+    _onInputBlur() {
+        if (this._switched || this._switcher())
+            return;
+        this._caret = null;
+        if (this._state === State.AUTO)
+            this._hide();
+        else
+            this._evaluate();
+        this._caretAutoOpened = false;
     }
 
     _request(tapped) {
@@ -277,6 +331,8 @@ export class Bridge {
     }
 
     _onMonitorsChanged() {
+        this._edgeTouch = null;
+        this._syncEdgeSwipe();
         this._keyboard.refit();
         if (this._lifted()) {
             this._positionKeyboard();
@@ -284,11 +340,48 @@ export class Bridge {
         }
     }
 
-    _show(state) {
+    _syncEdgeSwipe() {
+        const monitor = Main.layoutManager.bottomMonitor;
+        if (monitor) {
+            this._edge.set_position(monitor.x, monitor.y + monitor.height - Edge.HEIGHT);
+            this._edge.set_size(monitor.width, Edge.HEIGHT);
+        }
+        this._edge.visible = Boolean(monitor && !Main.sessionMode.isLocked &&
+            !this._keyboardAttached && !this._lifted());
+        if (!this._edge.visible)
+            this._edgeTouch = null;
+    }
+
+    _onEdgeTouch(event) {
+        const type = event.type();
+        const slot = event.get_event_sequence().get_slot();
+        if (type === Clutter.EventType.TOUCH_BEGIN) {
+            if (!this._edgeTouch) {
+                const [x, y] = event.get_coords();
+                this._edgeTouch = {slot, x, y};
+            }
+        } else if (this._edgeTouch?.slot === slot) {
+            if (type === Clutter.EventType.TOUCH_CANCEL) {
+                this._edgeTouch = null;
+            } else if (type === Clutter.EventType.TOUCH_END) {
+                const [x, y] = event.get_coords();
+                const start = this._edgeTouch;
+                this._edgeTouch = null;
+                const rise = start.y - y;
+                if (rise >= Edge.DISTANCE && rise > Math.abs(start.x - x))
+                    this._show(State.PINNED, Main.layoutManager.bottomIndex);
+            }
+        }
+        return Clutter.EVENT_STOP;
+    }
+
+    _show(state, monitor = Main.layoutManager.focusIndex) {
+        if (this._keyboardAttached)
+            return;
         if (this._state !== State.PINNED)
             this._state = state;
         this._armed = false;
-        Main.layoutManager.keyboardIndex = Main.layoutManager.focusIndex;
+        Main.layoutManager.keyboardIndex = monitor;
         this._box.show();
         if (this._fitIndex !== Main.layoutManager.keyboardIndex) {
             this._fitIndex = Main.layoutManager.keyboardIndex;
@@ -298,16 +391,18 @@ export class Bridge {
         this._keyboard.show();
         this._positionKeyboard();
         this._evaluate();
+        this._syncEdgeSwipe();
     }
 
     _hide() {
         this._state = State.HIDDEN;
+        this._caretAutoOpened = true;
         this._setFocusWindow(null);
-        this._caret = null;
         this._keyboard.reset();
         this._keyboard.translation_y = 0;
         this._keyboard.hide();
         this._box.hide();
+        this._syncEdgeSwipe();
     }
 
     _lifted() {
@@ -316,12 +411,36 @@ export class Bridge {
 
     _onFocusWindow() {
         this._caret = null;
+        this._caretAutoOpened = false;
         this._evaluate();
     }
 
-    _onCaret(rect) {
-        this._caret = rect.height > 0 ? rect : null;
+    _onCaret(rect, fromIBus = false) {
+        const window = global.display.get_focus_window();
+        const actor = window?.get_compositor_private();
+        this._caret = null;
+        if (actor && rect.height > 0) {
+            // Convert the screen coordinates to a window-relative position
+            // so moving the window doesn't change the required offset.
+            const originY = fromIBus ? window.get_buffer_rect().y : actor.y;
+            this._caret = {window, x: rect.x, y: rect.y - originY, height: rect.height};
+            if (this._maybeOpenForCaret(window, rect))
+                return;
+        }
         this._evaluate();
+    }
+
+    _maybeOpenForCaret(window, rect) {
+        if (this._lifted() || this._caretAutoOpened || this._keyboardAttached ||
+            !this._direct || this._armed || global.stage.key_focus || this._switcher())
+            return false;
+        const frame = window.get_frame_rect();
+        if (rect.x < frame.x || rect.x >= frame.x + frame.width ||
+            rect.y >= frame.y + frame.height || rect.y + rect.height <= frame.y)
+            return false;
+        this._caretAutoOpened = true;
+        this._show(State.AUTO, window.get_monitor());
+        return true;
     }
 
     _evaluate() {
@@ -331,7 +450,9 @@ export class Bridge {
         }
         const monitor = Main.layoutManager.keyboardMonitor;
         const window = global.display.get_focus_window();
-        if (!window || !monitor || global.stage.key_focus ||
+        const caret = this._caret;
+        const actor = window?.get_compositor_private();
+        if (!actor || !monitor || global.stage.key_focus ||
             window.get_monitor() !== Main.layoutManager.keyboardIndex) {
             this._setFocusWindow(null);
             return;
@@ -339,46 +460,58 @@ export class Bridge {
         const height = this._keyboard.height;
         if (height <= 0)
             return;
-        const top = monitor.y + monitor.height - height;
-        const caret = this._caret;
-        const frame = window.get_frame_rect();
-        const bottom = caret ? caret.y + caret.height : frame.y + frame.height;
-        if (this._focusWindow === window) {
-            if (bottom + height < top)
-                this._setFocusWindow(null);
-            return;
+        const screenBottom = monitor.y + monitor.height;
+        const originY = this._focusWindow === window ? this._focusWindowStartY : actor.y;
+        let inputBottom = monitor.y;
+        if (caret?.window === window) {
+            const caretTop = originY + caret.y;
+            if (caret.x >= monitor.x && caret.x < monitor.x + monitor.width && caretTop < screenBottom)
+                inputBottom = caretTop + caret.height;
+        } else if (this._isChatGPT(window)) {
+            // The desktop app's composer is anchored at the window bottom.
+            const frame = window.get_frame_rect();
+            inputBottom = Math.min(screenBottom, frame.y + frame.height + originY - window.get_buffer_rect().y);
         }
-        if (bottom >= top)
-            this._setFocusWindow(window);
-        else
-            this._setFocusWindow(null);
+        const offset = Math.max(0, Math.ceil(inputBottom - (screenBottom - height)));
+        this._setFocusWindow(offset > 0 || this._focusWindow === window ? window : null, offset);
     }
 
-    _setFocusWindow(window) {
+    _isChatGPT(window) {
+        return Shell.WindowTracker.get_default().get_window_app(window)?.get_id() === ChatGPT.DESKTOP_ID ||
+            window.get_wm_class()?.toLowerCase() === ChatGPT.WINDOW_CLASS;
+    }
+
+    _setFocusWindow(window, offset = 0) {
         const actor = window ? window.get_compositor_private() : null;
         const target = actor ? window : null;
-        if (this._focusWindow === target)
+        if (this._focusWindow === target) {
+            if (target && offset !== this._focusWindowOffset) {
+                this._focusWindowOffset = offset;
+                this._animateWindow(target, offset);
+            }
             return;
+        }
         if (this._focusWindow)
-            this._animateWindow(this._focusWindow, false);
+            this._animateWindow(this._focusWindow, 0, true);
         this._disconnectMoved();
         if (this._easing.has(actor))
             actor.remove_transition(Property.Y);
         this._focusWindowStartY = actor ? actor.y : null;
-        if (target) {
-            this._animateWindow(target, true);
-            this._connectMoved(target);
-        }
         this._focusWindow = target;
+        this._focusWindowOffset = offset;
+        if (target) {
+            this._connectMoved(target);
+            this._animateWindow(target, offset);
+        }
     }
 
-    _animateWindow(window, show) {
+    _animateWindow(window, offset, restore = false) {
         const actor = window.get_compositor_private();
         if (!actor)
             return;
-        const finalY = show
-            ? this._focusWindowStartY - this._keyboard.height
-            : this._focusWindowStartY;
+        const finalY = this._focusWindowStartY - offset;
+        if (actor.y === finalY && !actor.get_transition(Property.Y))
+            return;
         let unmanaged = false;
         const unmanagedId = window.connect(Signal.UNMANAGED, () => {
             unmanaged = true;
@@ -390,7 +523,7 @@ export class Bridge {
             onStopped: isFinished => {
                 window.disconnect(unmanagedId);
                 this._easing.delete(actor);
-                if (unmanaged || (show && !isFinished))
+                if (unmanaged || (!restore && !isFinished))
                     return;
                 actor.y = finalY;
                 this._sync(window, finalY);
@@ -415,9 +548,13 @@ export class Bridge {
     }
 
     _onMoved() {
+        const actor = this._focusWindow?.get_compositor_private();
+        actor?.remove_transition(Property.Y);
         this._disconnectMoved();
+        this._caret = null;
         this._focusWindow = null;
         this._focusWindowStartY = null;
+        this._focusWindowOffset = 0;
     }
 
     _connectMoved(window) {
@@ -470,6 +607,9 @@ export class Bridge {
         for (const {source, id} of this._connections)
             source.disconnect(id);
         this._connections = [];
+        this._edge.destroy();
+        this._edge = null;
+        this._edgeTouch = null;
         this._restoreLift();
 
         this._keyboard.release();
@@ -478,6 +618,9 @@ export class Bridge {
         this._keyboard = null;
         this._injections.clear();
         this._injections = null;
+        if (this._edgeSwipe)
+            this._edgeSwipe.enabled = true;
+        this._edgeSwipe = null;
         Main.keyboard._syncEnabled();
         this._box.visible = Boolean(Main.keyboard.visible);
         this._box.track_hover = true;

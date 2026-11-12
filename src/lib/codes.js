@@ -41,5 +41,6 @@ export const Kind = Object.freeze({
     FN: 'fn',
     PAD: 'pad',
     HIDE: 'hide',
+    HANGUL: 'hangul',
     SPACER: 'spacer',
 });
