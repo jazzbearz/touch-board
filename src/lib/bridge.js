@@ -54,8 +54,9 @@ const Indicator = Object.freeze({ROLE: 'touch-board'});
 
 const Lift = Object.freeze({DURATION: 150});
 
-const Edge = Object.freeze({HEIGHT: 12, DISTANCE: 48});
+const Edge = Object.freeze({HEIGHT: 12, DISTANCE: 48, CORNER_FRACTION: 0.1});
 const ChatGPT = Object.freeze({DESKTOP_ID: 'chatgpt.desktop', WINDOW_CLASS: 'chatgpt'});
+const TerminalApps = new Set(['org.gnome.Console.desktop', 'org.gnome.Terminal.desktop']);
 
 const Switch = Object.freeze({GRACE: 250});
 
@@ -98,7 +99,7 @@ export class Bridge {
     _caretAutoOpened = false;
     _keyboardAttached = false;
     _edgeSwipe = null;
-    _edge = null;
+    _edges = [];
     _edgeTouch = null;
 
     constructor(settings) {
@@ -144,9 +145,12 @@ export class Bridge {
             this._edgeSwipe.enabled = false;
         // Pick a Shell actor at touch-down so the window underneath never
         // receives the start of a sequence reserved for the keyboard.
-        this._edge = new St.Widget({reactive: true, visible: false});
-        Main.layoutManager.addTopChrome(this._edge);
-        this._track(this._edge, Signal.TOUCH, (_actor, event) => this._onEdgeTouch(event));
+        for (let i = 0; i < 2; i++) {
+            const edge = new St.Widget({reactive: true, visible: false});
+            this._edges.push(edge);
+            Main.layoutManager.addTopChrome(edge);
+            this._track(edge, Signal.TOUCH, (_actor, event) => this._onEdgeTouch(event));
+        }
         this._track(Main.sessionMode, Signal.SESSION, () => this._syncEdgeSwipe());
 
         this._track(this._box, Signal.ADDED, (_box, actor) => {
@@ -277,8 +281,19 @@ export class Bridge {
     }
 
     _request(tapped) {
-        if (tapped || this._a11y.get_boolean(A11y.KEYBOARD))
+        if ((tapped || this._a11y.get_boolean(A11y.KEYBOARD)) &&
+            !this._isTerminalInput(global.display.get_focus_window()))
             this._show(State.AUTO);
+    }
+
+    _isTerminalInput(window) {
+        if (!window || global.stage.key_focus)
+            return false;
+        if (Main.inputMethod.currentFocus &&
+            Main.inputMethod.content_purpose === Clutter.InputContentPurpose.TERMINAL)
+            return true;
+        const app = Shell.WindowTracker.get_default().get_window_app(window);
+        return TerminalApps.has(app?.get_id());
     }
 
     _onDevice(device) {
@@ -342,13 +357,20 @@ export class Bridge {
 
     _syncEdgeSwipe() {
         const monitor = Main.layoutManager.bottomMonitor;
-        if (monitor) {
-            this._edge.set_position(monitor.x, monitor.y + monitor.height - Edge.HEIGHT);
-            this._edge.set_size(monitor.width, Edge.HEIGHT);
-        }
-        this._edge.visible = Boolean(monitor && !Main.sessionMode.isLocked &&
+        const visible = Boolean(monitor && !Main.sessionMode.isLocked &&
             !this._keyboardAttached && !this._lifted());
-        if (!this._edge.visible)
+        if (monitor) {
+            const [left, right] = this._edges;
+            const width = Math.floor(monitor.width * Edge.CORNER_FRACTION);
+            const y = monitor.y + monitor.height - Edge.HEIGHT;
+            left.set_position(monitor.x, y);
+            right.set_position(monitor.x + monitor.width - width, y);
+            for (const edge of this._edges)
+                edge.set_size(width, Edge.HEIGHT);
+        }
+        for (const edge of this._edges)
+            edge.visible = visible;
+        if (!visible)
             this._edgeTouch = null;
     }
 
@@ -432,7 +454,8 @@ export class Bridge {
 
     _maybeOpenForCaret(window, rect) {
         if (this._lifted() || this._caretAutoOpened || this._keyboardAttached ||
-            !this._direct || this._armed || global.stage.key_focus || this._switcher())
+            !this._direct || this._armed || global.stage.key_focus || this._switcher() ||
+            this._isTerminalInput(window))
             return false;
         const frame = window.get_frame_rect();
         if (rect.x < frame.x || rect.x >= frame.x + frame.width ||
@@ -607,8 +630,9 @@ export class Bridge {
         for (const {source, id} of this._connections)
             source.disconnect(id);
         this._connections = [];
-        this._edge.destroy();
-        this._edge = null;
+        for (const edge of this._edges)
+            edge.destroy();
+        this._edges = [];
         this._edgeTouch = null;
         this._restoreLift();
 
